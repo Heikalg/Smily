@@ -77,10 +77,13 @@ static void drawSilhouette(const Pose &p) {
 
   u8g2.setDrawColor(1);
 
-  // stubby arms, one each side, and two little feet peeking out underneath
+  // stubby arms, one each side, and two little feet peeking out underneath.
+  // Draw them at their true body-relative position and let u8g2 clip anything
+  // off-screen: clamping the x to the panel edge used to strand a detached
+  // blob of "dots" against the left/right edge when the body leaned.
   const int16_t armY = p.bottom - p.h / 3;
-  u8g2.drawDisc(sclamp(x - 1, 4, 123), armY, 4);
-  u8g2.drawDisc(sclamp(p.right() + 1, 4, 123), armY, 4);
+  u8g2.drawDisc(x - 1, armY, 4);
+  u8g2.drawDisc(p.right() + 1, armY, 4);
   u8g2.drawDisc(p.cx - p.w / 4, p.bottom + 2, 4);
   u8g2.drawDisc(p.cx + p.w / 4, p.bottom + 2, 4);
 
@@ -180,6 +183,17 @@ static void mouthO(int16_t x, int16_t y) {
   u8g2.drawDisc(x, y + 2, 2);
 }
 
+// big yawning oval, h grows with the yawn
+static void mouthYawn(int16_t x, int16_t y, int16_t h) {
+  if (h < 2) {
+    mouthNeutral(x, y);
+    return;
+  }
+  u8g2.setDrawColor(INK);
+  u8g2.drawDisc(x, y + h / 2, 3);
+  if (h > 6) u8g2.drawBox(x - 3, y + 2, 7, h - 4);
+}
+
 static void blush(const Pose &p, int16_t y) {
   u8g2.setDrawColor(INK);
   for (int8_t i = 0; i < 3; i++) {
@@ -258,27 +272,82 @@ static int16_t kfValue(const KF *k, uint8_t n, uint16_t f) {
 }
 
 // ---------------------------------------------------------------------------
-// ANIM_IDLE - slow breathing, random blink, leans with the accelerometer
+// ANIM_IDLE - slow breathing, random blink, leans with the accelerometer.
+// On top of that the engine occasionally asks for a fidget: a yawn, a slow
+// look-around, or a wiggle. Each is a short gesture whose progress arrives in
+// ctx.fidgetMs / ctx.fidgetLenMs, so the renderer owns the shape but not the
+// clock. A triangular 0..255..0 envelope eases every fidget in and out.
 // ---------------------------------------------------------------------------
+static uint8_t fidgetEnv(const FaceCtx &ctx) {
+  if (!ctx.fidgetLenMs) return 0;
+  uint16_t half = ctx.fidgetLenMs / 2;
+  if (!half) return 0;
+  uint16_t t = ctx.fidgetMs < ctx.fidgetLenMs ? ctx.fidgetMs : ctx.fidgetLenMs;
+  uint16_t up = t < half ? t : (uint16_t)(ctx.fidgetLenMs - t);
+  uint32_t v = (uint32_t)up * 255 / half;
+  return (uint8_t)(v > 255 ? 255 : v);
+}
+
 static void renderIdle(uint16_t f, const FaceCtx &ctx) {
+  const uint8_t env = fidgetEnv(ctx);  // 0 at rest, 255 at the peak
+
   Pose p;
   // ~5.6 s breathing cycle, plus whatever squish the last jolt left behind
-  p.squish(wave((uint8_t)(f * 3), 2) + (int16_t)ctx.jolt);
-  p.cx = BODY_CX + ctx.leanPx;
+  int16_t squish = wave((uint8_t)(f * 3), 2) + (int16_t)ctx.jolt;
+  int16_t gaze = ctx.glancePx + ctx.leanPx / 2;  // eyes lead the lean
+  int16_t cx = BODY_CX + ctx.leanPx;
+
+  // Fidget overrides, applied as offsets on top of the resting pose/gaze.
+  if (ctx.fidget == FIDGET_YAWN) {
+    squish -= (env * 7) / 255;            // stretch up as the yawn peaks
+  } else if (ctx.fidget == FIDGET_WIGGLE) {
+    // three quick sways, amplitude eased by the envelope
+    const int16_t sway = wave((uint8_t)(ctx.fidgetMs / 4), (env * 7) / 255);
+    cx += sway;
+    gaze += sway / 2;
+  } else if (ctx.fidget == FIDGET_LOOK) {
+    // sweep the gaze L -> R -> C across the gesture
+    const uint8_t ph = (uint8_t)((uint32_t)ctx.fidgetMs * 255 / smax(ctx.fidgetLenMs, 1));
+    gaze += (isin(ph) * 5) / 127;
+  }
+
+  p.squish(squish);
+  p.cx = cx;
   drawSilhouette(p);
 
   const int16_t eyeY = p.eyeY();
   const int16_t dx = p.eyeDX();
-  const int16_t gaze = ctx.glancePx + ctx.leanPx / 2;  // eyes lead the lean
+  const int16_t exL = p.cx - dx + gaze;
+  const int16_t exR = p.cx + dx + gaze;
 
-  if (ctx.blink) {
-    eyeBlink(p.cx - dx + gaze, eyeY);
-    eyeBlink(p.cx + dx + gaze, eyeY);
+  // Eyes: a yawn squeezes them shut and a blink overrides; otherwise the eyes
+  // stay the default open oval. Mood is expressed through the MOUTH only -
+  // swapping eye SHAPES every few seconds snapped harshly, so it was dropped.
+  if (ctx.fidget == FIDGET_YAWN && env > 90) {
+    eyeHappy(exL, eyeY);
+    eyeHappy(exR, eyeY);
+  } else if (ctx.blink) {
+    eyeBlink(exL, eyeY);
+    eyeBlink(exR, eyeY);
   } else {
-    eyeOpen(p.cx - dx + gaze, eyeY);
-    eyeOpen(p.cx + dx + gaze, eyeY);
+    eyeOpen(exL, eyeY);
+    eyeOpen(exR, eyeY);
   }
-  mouthNeutral(p.cx + gaze / 2, p.mouthY());
+
+  // Mouth carries the mood; the yawn overrides it with its growing oval.
+  const int16_t mx = p.cx + gaze / 2;
+  const int16_t my = p.mouthY();
+  if (ctx.fidget == FIDGET_YAWN) {
+    mouthYawn(mx, my - 1, (env * 12) / 255);
+  } else {
+    switch (ctx.mood) {
+      case MOOD_HAPPY:   mouthHappy(mx, my - 1); break;  // omega smile
+      case MOOD_CONTENT: mouthSmall(mx, my);     break;  // small content mouth
+      case MOOD_SLEEPY:  mouthSmall(mx, my);     break;  // small relaxed mouth
+      case MOOD_NEUTRAL:
+      default:           mouthNeutral(mx, my);   break;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

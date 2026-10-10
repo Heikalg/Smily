@@ -23,6 +23,27 @@ enum AnimId : uint8_t {
   ANIM_COUNT
 };
 
+// Idle fidgets: short one-off gestures layered on the idle loop. FIDGET_NONE
+// is the resting idle; the rest are picked at random by the engine's fidget
+// timer and reported to the renderer with how long they have been running.
+enum FidgetId : uint8_t {
+  FIDGET_NONE = 0,
+  FIDGET_YAWN,
+  FIDGET_LOOK,
+  FIDGET_WIGGLE,
+  FIDGET_COUNT
+};
+
+// Idle moods: the resting expression the idle face wears, re-rolled at random
+// by the engine so Smily does not always look the same when doing nothing.
+enum MoodId : uint8_t {
+  MOOD_NEUTRAL = 0,  // the default resting face
+  MOOD_CONTENT,      // soft happy eyes, small smile
+  MOOD_SLEEPY,       // relaxed half-closed eyes
+  MOOD_HAPPY,        // bright happy eyes + omega smile
+  MOOD_COUNT
+};
+
 // Everything a renderer is allowed to know about the outside world.
 struct FaceCtx {
   int8_t leanPx;    // body lean from the smoothed accelerometer tilt
@@ -32,6 +53,10 @@ struct FaceCtx {
   bool noMotion;    // MPU did not answer (only drawn when overlay is on)
   int16_t dbgA;     // motion overlay: jerk
   int16_t dbgB;     // motion overlay: gyro magnitude
+  FidgetId fidget;      // active idle fidget, or FIDGET_NONE
+  uint16_t fidgetMs;    // ms the current fidget has been running
+  uint16_t fidgetLenMs; // total duration of the current fidget
+  MoodId mood;          // resting idle expression
 };
 
 struct AnimDef {
@@ -73,6 +98,8 @@ class Animator {
  private:
   void scheduleBlink(uint32_t now);
   void scheduleGlance(uint32_t now);
+  void scheduleFidget(uint32_t now);
+  void scheduleMood(uint32_t now);
 
   AnimId _id = ANIM_BLANK;
   uint16_t _frame = 0;
@@ -86,6 +113,16 @@ class Animator {
   uint32_t _nextGlanceMs = 0;
   uint32_t _glanceUntilMs = 0;
   int8_t _glance = 0;
+
+  // Idle fidgets: one gesture at a time, with its own start/end clock.
+  uint32_t _nextFidgetMs = 0;
+  uint32_t _fidgetStartMs = 0;
+  uint32_t _fidgetUntilMs = 0;
+  FidgetId _fidget = FIDGET_NONE;
+
+  // Idle mood: the resting expression, re-rolled on its own timer.
+  uint32_t _nextMoodMs = 0;
+  MoodId _mood = MOOD_NEUTRAL;
 
   int8_t _tilt = 0;
   uint8_t _jolt = 0;

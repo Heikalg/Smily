@@ -1,0 +1,8 @@
+# KiroCrew session / agent working directory - never commit
+.kiro/
+
+# OS / editor cruft
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp

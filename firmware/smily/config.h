@@ -41,7 +41,7 @@
 #ifndef GOODNIGHT_ANIM_MS
 #define GOODNIGHT_ANIM_MS    860      // set to 0 to sleep instantly, no goodbye
 #endif
-#define SLEEP_TIMEOUT_MS     15000
+#define SLEEP_TIMEOUT_MS     100000
 
 // --- Idle liveliness -------------------------------------------------------
 #define BLINK_MIN_MS         3000     // spec 5: random blink every 3-6 s
@@ -51,6 +51,24 @@
 #define GLANCE_MIN_MS        4500     // eyes drift sideways now and then
 #define GLANCE_MAX_MS        9000
 #define GLANCE_HOLD_MS       520
+
+// --- Idle fidgets ----------------------------------------------------------
+// Every so often a bored idle Smily performs one short gesture (a yawn, a
+// look-around, a wiggle) and then settles back. These are variations layered
+// on top of the breathing idle loop; they are NOT separate states, so the
+// state machine never sees them. Set FIDGET_MAX_MS <= FIDGET_MIN_MS to disable.
+#define FIDGET_MIN_MS        8000     // earliest a fidget may fire after the last
+#define FIDGET_MAX_MS        20000    // latest; roll is uniform in [min, max)
+#define FIDGET_YAWN_MS       1400     // stretch up, mouth wide, eyes squeezed
+#define FIDGET_LOOK_MS       1600     // slow deliberate eye sweep L -> R -> C
+#define FIDGET_WIGGLE_MS     1100     // quick side-to-side body sway
+
+// --- Idle mood -------------------------------------------------------------
+// The resting idle expression is not fixed: the engine rolls a new mood every
+// so often (neutral / content / sleepy / happy), so an idle Smily does not
+// always wear the same face. Blink, glance and fidgets layer on top of it.
+#define MOOD_MIN_MS          6000     // earliest a new resting mood is rolled
+#define MOOD_MAX_MS          14000    // latest; roll is uniform in [min, max)
 
 // --- Input handler ---------------------------------------------------------
 #define TOUCH_DEBOUNCE_MS    30
@@ -66,9 +84,9 @@
 //   jerk   : change in the accel vector between samples, 256 units == 1 g
 //   gyroMag: total rotation rate, roughly 1 unit == 1 deg/s
 // Build with SMILY_MOTION_DEBUG 1 and read the serial peaks to tune these.
-#define SHAKE_JERK_THRESHOLD 300      // ~1.2 g of change in 20 ms
-#define SHAKE_GYRO_DPS       320
-#define SHAKE_HITS_REQUIRED  3        // ignores a single knock or a drop
+#define SHAKE_JERK_THRESHOLD 250      // ~1.2 g of change in 20 ms
+#define SHAKE_GYRO_DPS       270
+#define SHAKE_HITS_REQUIRED  2        // ignores a single knock or a drop
 #define SHAKE_WINDOW_MS      700
 #define SHAKE_REFRACTORY_MS  60
 #define SHAKE_COOLDOWN_MS    1800     // no re-trigger while dizzy is playing
@@ -83,8 +101,8 @@
 
 // Tilt -> how far the mochi leans. 0 = accel X, 1 = Y, 2 = Z.
 // Flip MOTION_TILT_INVERT if it leans the wrong way once mounted.
-#define MOTION_TILT_AXIS     0
-#define MOTION_TILT_INVERT   0
+#define MOTION_TILT_AXIS     1
+#define MOTION_TILT_INVERT   1
 #define MOTION_TILT_DIV      300      // raw LSB per pixel of lean
 #define MOTION_TILT_MAX_PX   8
 #define MOTION_TILT_SMOOTH   3        // IIR shift: higher = slower, calmer

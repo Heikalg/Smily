@@ -9,6 +9,7 @@
 //
 // Run: tools/preview/build.sh
 // ---------------------------------------------------------------------------
+#define _USE_MATH_DEFINES  // MSYS2/MinGW only exposes M_PI with this set
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
@@ -142,6 +143,48 @@ static void captureAnim(AnimId id, const char *name, int frames, int cols,
   writeSheet(std::string("out/") + name + ".pgm", cols, scale, 0);
 }
 
+static void captureFidget(FidgetId fid, uint16_t lenMs, const char *name) {
+  g_frames.clear();
+  g_capture = true;
+  FaceCtx ctx;
+  ctx.leanPx = ctx.glancePx = 0;
+  ctx.jolt = 0;
+  ctx.blink = false;
+  ctx.noMotion = false;
+  ctx.dbgA = ctx.dbgB = 0;
+  ctx.fidget = fid;
+  ctx.fidgetLenMs = lenMs;
+  ctx.mood = MOOD_NEUTRAL;
+  const uint16_t n = lenMs / FRAME_INTERVAL_MS;
+  for (uint16_t i = 0; i < n; i++) {
+    ctx.fidgetMs = (uint16_t)(i * FRAME_INTERVAL_MS);
+    faces_render(ANIM_IDLE, i, ctx);
+    u8g2.sendBuffer();
+  }
+  g_capture = false;
+  writeSheet(std::string("out/") + name + ".pgm", 6, 2, 0);
+}
+
+static void captureMoods() {
+  g_frames.clear();
+  g_capture = true;
+  FaceCtx ctx;
+  ctx.leanPx = ctx.glancePx = 0;
+  ctx.jolt = 0;
+  ctx.blink = false;
+  ctx.noMotion = false;
+  ctx.dbgA = ctx.dbgB = 0;
+  ctx.fidget = FIDGET_NONE;
+  ctx.fidgetMs = ctx.fidgetLenMs = 0;
+  for (uint8_t m = 0; m < MOOD_COUNT; m++) {
+    ctx.mood = (MoodId)m;
+    faces_render(ANIM_IDLE, 0, ctx);  // frame 0: no breathing offset
+    u8g2.sendBuffer();
+  }
+  g_capture = false;
+  writeSheet("out/09-moods.pgm", MOOD_COUNT, 3, 0);
+}
+
 static void captureHero() {
   // one representative frame per state, rendered large
   struct Pick {
@@ -160,6 +203,9 @@ static void captureHero() {
     ctx.blink = (i == 5);
     ctx.noMotion = false;
     ctx.dbgA = ctx.dbgB = 0;
+    ctx.fidget = FIDGET_NONE;
+    ctx.fidgetMs = ctx.fidgetLenMs = 0;
+    ctx.mood = MOOD_NEUTRAL;
     faces_render(picks[i].id, picks[i].frame, ctx);
     u8g2.sendBuffer();
   }
@@ -261,13 +307,24 @@ static void runSim() {
 
   printf("\n--- gentle handling must NOT trigger dizzy ---\n");
   for (int i = 0; i < 2000; i++) {  // slow 25 degree tilt over 2 s
-    hostMpu.ax = (int16_t)(1800.0 * (i / 2000.0));
+    const int16_t v = (int16_t)(1800.0 * (i / 2000.0));
+    // drive whichever axis config.h selects for the lean, so this test
+    // stays valid when MOTION_TILT_AXIS changes (e.g. a rotated mounting)
+#if MOTION_TILT_AXIS == 1
+    hostMpu.ay = v;
+#elif MOTION_TILT_AXIS == 2
+    hostMpu.az = 4096 + v;
+#else
+    hostMpu.ax = v;
+#endif
     hostMillis++;
     loopBody();
   }
   check(sm_state() == STATE_IDLE, "slow tilt leaves the state alone");
   const MotionEvents leaned = motion_poll(millis());
-  check(leaned.tiltPx > 0, "tilt produces a lean offset for the renderer");
+  // Direction depends on MOTION_TILT_AXIS / MOTION_TILT_INVERT (a mounting
+  // detail tuned on hardware), so assert a lean is produced, not its sign.
+  check(leaned.tiltPx != 0, "tilt produces a lean offset for the renderer");
   restAtTable();
   advance(600);
 
@@ -356,6 +413,9 @@ int main(int argc, char **argv) {
     ctx.blink = false;
     ctx.noMotion = false;
     ctx.dbgA = ctx.dbgB = 0;
+    ctx.fidget = FIDGET_NONE;
+    ctx.fidgetMs = ctx.fidgetLenMs = 0;
+    ctx.mood = MOOD_NEUTRAL;
     faces_render(ANIM_IDLE, 0, ctx);
     u8g2.sendBuffer();
     faces_render(ANIM_PET, 4, ctx);
@@ -378,6 +438,10 @@ int main(int argc, char **argv) {
   captureAnim(ANIM_DIZZY, "04-dizzy", anim_frameCount(ANIM_DIZZY), 6, 2, false);
   captureAnim(ANIM_GOODNIGHT, "05-goodnight",
               anim_frameCount(ANIM_GOODNIGHT), 6, 2, false);
+  captureFidget(FIDGET_YAWN, FIDGET_YAWN_MS, "06-fidget-yawn");
+  captureFidget(FIDGET_LOOK, FIDGET_LOOK_MS, "07-fidget-look");
+  captureFidget(FIDGET_WIGGLE, FIDGET_WIGGLE_MS, "08-fidget-wiggle");
+  captureMoods();
   captureHero();
 
   runSim();

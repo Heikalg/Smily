@@ -32,6 +32,8 @@ void Animator::begin(uint32_t now) {
   _lastFrameMs = now - FRAME_INTERVAL_MS;  // render the first frame at once
   scheduleBlink(now);
   scheduleGlance(now);
+  scheduleFidget(now);
+  scheduleMood(now);
 }
 
 void Animator::play(AnimId id, uint32_t now) {
@@ -47,6 +49,9 @@ void Animator::play(AnimId id, uint32_t now) {
   if (_frameCount == 0 && ANIMS[id].durationMs == 0 && id == ANIM_IDLE) {
     scheduleBlink(now);
     scheduleGlance(now);
+    scheduleFidget(now);
+    scheduleMood(now);
+    _fidget = FIDGET_NONE;
   }
 }
 
@@ -57,6 +62,19 @@ void Animator::scheduleBlink(uint32_t now) {
 
 void Animator::scheduleGlance(uint32_t now) {
   _nextGlanceMs = now + smilyRandRange(GLANCE_MIN_MS, GLANCE_MAX_MS);
+}
+
+void Animator::scheduleFidget(uint32_t now) {
+  // Disabled when the window is empty or inverted.
+  if (FIDGET_MAX_MS <= FIDGET_MIN_MS) {
+    _nextFidgetMs = now + 0x3FFFFFFF;  // effectively never
+    return;
+  }
+  _nextFidgetMs = now + smilyRandRange(FIDGET_MIN_MS, FIDGET_MAX_MS);
+}
+
+void Animator::scheduleMood(uint32_t now) {
+  _nextMoodMs = now + smilyRandRange(MOOD_MIN_MS, MOOD_MAX_MS);
 }
 
 bool Animator::update(uint32_t now) {
@@ -72,6 +90,10 @@ bool Animator::update(uint32_t now) {
   ctx.noMotion = _noMotion;
   ctx.dbgA = _dbgA;
   ctx.dbgB = _dbgB;
+  ctx.fidget = FIDGET_NONE;
+  ctx.fidgetMs = 0;
+  ctx.fidgetLenMs = 0;
+  ctx.mood = MOOD_NEUTRAL;
 
   if (_id == ANIM_IDLE) {
     // Blink: fire when due, then either queue the second half of a double
@@ -95,6 +117,40 @@ bool Animator::update(uint32_t now) {
       scheduleGlance(now);
     }
     if (!timeReached(now, _glanceUntilMs)) ctx.glancePx = _glance;
+
+    // Mood: re-roll the resting expression on its own slow timer, but never
+    // mid-fidget (a fidget owns the face while it runs). Picked uniformly.
+    if (_fidget == FIDGET_NONE && timeReached(now, _nextMoodMs)) {
+      _mood = (MoodId)(smilyRand() % MOOD_COUNT);
+      scheduleMood(now);
+    }
+    ctx.mood = _mood;
+
+    // Fidget: when idle has been resting long enough, perform one short
+    // gesture. Only one runs at a time; a running fidget blocks the next
+    // roll. Picking is uniform over the real gestures (skips FIDGET_NONE).
+    if (_fidget == FIDGET_NONE && timeReached(now, _nextFidgetMs)) {
+      _fidget = (FidgetId)(FIDGET_YAWN + (smilyRand() % (FIDGET_COUNT - 1)));
+      uint16_t len = FIDGET_YAWN_MS;
+      if (_fidget == FIDGET_LOOK) len = FIDGET_LOOK_MS;
+      else if (_fidget == FIDGET_WIGGLE) len = FIDGET_WIGGLE_MS;
+      _fidgetStartMs = now;
+      _fidgetUntilMs = now + len;
+    }
+    if (_fidget != FIDGET_NONE) {
+      if (timeReached(now, _fidgetUntilMs)) {
+        _fidget = FIDGET_NONE;        // gesture finished, back to plain idle
+        scheduleFidget(now);          // roll the next one
+      } else {
+        ctx.fidget = _fidget;
+        ctx.fidgetMs = (uint16_t)elapsed(now, _fidgetStartMs);
+        ctx.fidgetLenMs = (uint16_t)(_fidgetUntilMs - _fidgetStartMs);
+        // A yawn owns the eyes (they squeeze shut), so the random blink must
+        // not fight it; the look fidget owns the gaze instead of the glance.
+        if (_fidget == FIDGET_YAWN) ctx.blink = false;
+        if (_fidget == FIDGET_LOOK) ctx.glancePx = 0;
+      }
+    }
   }
 
   faces_render(_id, _frame, ctx);  // composes the whole off-screen buffer
