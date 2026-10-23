@@ -6,6 +6,7 @@
 //   WAKE  --2 s-->            IDLE
 //   IDLE  --single tap-->     PET      --2 s-->   IDLE
 //   IDLE  --3 taps / shake--> DIZZY    --done-->  IDLE
+//   IDLE  --long press-->     WEATHER  --8 s / tap--> IDLE
 //   IDLE  --15 s quiet-->     SLEEP    --touch--> WAKE (via Deep Sleep reset)
 // ---------------------------------------------------------------------------
 #pragma once
@@ -21,6 +22,7 @@ enum SystemState : uint8_t {
   STATE_IDLE,
   STATE_PET,
   STATE_DIZZY,
+  STATE_WEATHER,
   STATE_SLEEP,
 };
 

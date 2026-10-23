@@ -18,6 +18,7 @@ enum AnimId : uint8_t {
   ANIM_IDLE,       // looping: breathing + blink + tilt lean
   ANIM_PET,        // happy bounce with hearts, 2 s
   ANIM_DIZZY,      // shaken: swirl eyes and orbiting stars
+  ANIM_WEATHER,    // long-press: full weather overview (temp + glyph)
   ANIM_GOODNIGHT,  // short "see you" before the panel powers down
   ANIM_BLANK,      // nothing lit
   ANIM_COUNT
@@ -44,6 +45,20 @@ enum MoodId : uint8_t {
   MOOD_COUNT
 };
 
+// Weather "sky": the Open-Meteo WMO code bucketed into the few looks Smily
+// actually draws. SE Asia, so no snow bucket (see config.h). SKY_NONE means
+// no weather reading yet -- draw nothing weather-ish.
+enum SkyId : uint8_t {
+  SKY_NONE = 0,  // no data yet
+  SKY_CLEAR,     // code 0        (sun / moon)
+  SKY_CLOUD,     // 1,2,3,45,48   (clouds, fog)
+  SKY_RAIN,      // 51..67,80..82 (drizzle to showers)
+  SKY_STORM      // 95,96,99      (thunderstorm)
+};
+
+// Fold a raw Open-Meteo weather_code into a SkyId. Defined in faces.cpp.
+SkyId sky_from_code(int code);
+
 // Everything a renderer is allowed to know about the outside world.
 struct FaceCtx {
   int8_t leanPx;    // body lean from the smoothed accelerometer tilt
@@ -57,6 +72,22 @@ struct FaceCtx {
   uint16_t fidgetMs;    // ms the current fidget has been running
   uint16_t fidgetLenMs; // total duration of the current fidget
   MoodId mood;          // resting idle expression
+
+  // Weather, read from the net layer and bucketed by the state machine. The
+  // idle face uses `sky` for its quiet ambient layer; the weather view uses
+  // all three. tempC/isDay are only meaningful when sky != SKY_NONE.
+  SkyId sky = SKY_NONE;  // bucketed weather look, SKY_NONE if no reading yet
+  int8_t tempC = 0;      // whole degrees Celsius, for the overview readout
+  int8_t humidity = -1;  // measured relative humidity %, -1 if no sensor reading
+  bool isDay = true;     // sun vs moon on CLEAR
+  int8_t hour = -1;      // local clock HH, -1 if unknown
+  int8_t minute = -1;    // local clock MM, -1 if unknown
+
+  // Fetch-error state, so the weather view can show an error ONLY on a real
+  // failure with no good reading to fall back on. errCode carries the reason
+  // (<0 transport e.g. -11, >0 HTTP status, 0 other) for display.
+  bool netError = false;
+  int16_t errCode = 0;
 };
 
 struct AnimDef {
@@ -95,6 +126,30 @@ class Animator {
     _dbgB = gyro;
   }
 
+  // Weather, pushed in by the state machine. `sky`/`isDay` come from the net
+  // layer; `tempC`/`humidity` come from the on-board DHT11 sensor (humidity
+  // < 0 means no sensor reading yet). Carried into every FaceCtx so both the
+  // idle ambient and the weather view can read it.
+  void setWeather(SkyId sky, int8_t tempC, int8_t humidity, bool isDay) {
+    _sky = sky;
+    _tempC = tempC;
+    _humidity = humidity;
+    _wIsDay = isDay;
+  }
+
+  // Local clock from the weather fetch (timezone=auto). -1 = unknown.
+  void setClock(int8_t hour, int8_t minute) {
+    _hour = hour;
+    _minute = minute;
+  }
+
+  // Last fetch error, shown on the weather view only when there is no good
+  // reading to fall back on.
+  void setNetError(bool failed, int16_t code) {
+    _netError = failed;
+    _errCode = code;
+  }
+
  private:
   void scheduleBlink(uint32_t now);
   void scheduleGlance(uint32_t now);
@@ -129,6 +184,16 @@ class Animator {
   bool _noMotion = false;
   int16_t _dbgA = 0;
   int16_t _dbgB = 0;
+
+  // Latest weather, mirrored into every FaceCtx.
+  SkyId _sky = SKY_NONE;
+  int8_t _tempC = 0;
+  int8_t _humidity = -1;
+  bool _wIsDay = true;
+  bool _netError = false;
+  int16_t _errCode = 0;
+  int8_t _hour = -1;
+  int8_t _minute = -1;
 };
 
 extern Animator anim;

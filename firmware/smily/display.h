@@ -22,3 +22,8 @@ void display_flush();
 // Blank the panel RAM, then put the SH1106 into its low-power state.
 // Called before Deep Sleep so nothing flashes on the next wake (spec 2.3).
 void display_sleep();
+
+#if SMILY_EDGE_TEST
+// Diagnostic: draw a static edge-test pattern (see display.cpp).
+void display_edge_test();
+#endif

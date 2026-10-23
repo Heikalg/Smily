@@ -17,6 +17,7 @@ static const AnimDef ANIMS[ANIM_COUNT] = {
     /* ANIM_IDLE      */ {0, true},
     /* ANIM_PET       */ {PET_ANIM_MS, false},
     /* ANIM_DIZZY     */ {DIZZY_ANIM_MS, false},
+    /* ANIM_WEATHER   */ {WEATHER_VIEW_MS, false},
     /* ANIM_GOODNIGHT */ {GOODNIGHT_ANIM_MS, false},
     /* ANIM_BLANK     */ {0, true},
 };
@@ -94,6 +95,14 @@ bool Animator::update(uint32_t now) {
   ctx.fidgetMs = 0;
   ctx.fidgetLenMs = 0;
   ctx.mood = MOOD_NEUTRAL;
+  ctx.sky = _sky;
+  ctx.tempC = _tempC;
+  ctx.humidity = _humidity;
+  ctx.isDay = _wIsDay;
+  ctx.netError = _netError;
+  ctx.errCode = _errCode;
+  ctx.hour = _hour;
+  ctx.minute = _minute;
 
   if (_id == ANIM_IDLE) {
     // Blink: fire when due, then either queue the second half of a double

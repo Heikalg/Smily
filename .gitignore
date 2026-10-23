@@ -1,6 +1,10 @@
 # KiroCrew session / agent working directory - never commit
 .kiro/
 
+# Secrets - real Wi-Fi credentials / API keys. NEVER commit this.
+# secrets.example.h (the template) IS committed as documentation.
+firmware/smily/secrets.h
+
 # OS / editor cruft
 Thumbs.db
 Desktop.ini

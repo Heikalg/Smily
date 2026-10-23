@@ -28,6 +28,15 @@ class U8G2Host {
   void setFont(const uint8_t *) {}
   void drawStr(int, int, const char *) {}  // overlay text not previewed
 
+  // Panel-RAM clear (all columns, including the ones sendBuffer skips). On the
+  // host this is the same as clearing the buffer.
+  void clearDisplay() { clearBuffer(); }
+
+  // u8g2's low-level handle; only x_offset is exercised by the firmware.
+  struct U8x8Host { int x_offset = 0; };
+  U8x8Host u8x8;
+  U8x8Host *getU8x8() { return &u8x8; }
+
   void clearBuffer() { std::memset(buf, 0, sizeof(buf)); }
   void sendBuffer();  // defined in preview.cpp: captures the frame
 

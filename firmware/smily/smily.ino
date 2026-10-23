@@ -26,7 +26,9 @@
 #include "display.h"
 #include "input_handler.h"
 #include "motion.h"
+#include "net.h"
 #include "power.h"
+#include "sensor.h"
 #include "state_machine.h"
 #include "util.h"
 
@@ -46,14 +48,26 @@ void setup() {
   display_begin();
   input_begin(now, /*ignoreHeldTouch=*/cause == WAKE_TOUCH);
   motion_begin();
+  net_begin(now);   // Wi-Fi connect starts in the background; non-blocking
+  sensor_begin(now); // DHT11 temp/humidity; non-blocking, reads on a timer
   sm_begin(now, cause);
 }
 
 void loop() {
+#if SMILY_EDGE_TEST
+  // Diagnostic build: the static edge-test pattern is already on the panel from
+  // display_begin(); do nothing so it stays put for photographing. Set
+  // SMILY_EDGE_TEST 0 in config.h to restore normal operation.
+  delay(1000);
+  return;
+#endif
+
   const uint32_t now = millis();
 
   const InputEvents in = input_poll(now);    // every pass: debounce needs it
   const MotionEvents mo = motion_poll(now);  // self-limits to 50 Hz
+  net_poll(now);                             // advances Wi-Fi/weather, non-blocking
+  sensor_poll(now);                          // reads DHT11 when due, non-blocking
 
   sm_update(now, in, mo);  // frame limiting happens inside the engine
 }

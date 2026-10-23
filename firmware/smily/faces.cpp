@@ -55,15 +55,29 @@ struct Pose {
   int16_t bottom = BODY_BOTTOM;
   int16_t w = BODY_W;
   int16_t h = BODY_H;
+  // The resting size squish() flexes around. Defaults to the full body, so
+  // every existing caller is unchanged; renderWeather sets a smaller base so
+  // its Smily stays small even after squish() (which otherwise snaps w/h back
+  // to the full BODY_W/BODY_H and was blowing the weather-view Smily up).
+  int16_t baseW = BODY_W;
+  int16_t baseH = BODY_H;
+
+  // Shrink to an absolute size (used by the weather view). Call before squish.
+  void resize(int16_t newW, int16_t newH) {
+    baseW = w = newW;
+    baseH = h = newH;
+  }
 
   // squish keeps the mochi's area roughly constant: wider means flatter
   void squish(int16_t s) {
-    w = BODY_W + s;
-    h = BODY_H - s;
+    w = baseW + s;
+    h = baseH - s;
   }
   int16_t eyeY() const { return bottom - (h * MOCHI_EYE_Y_PCT) / 100; }
   int16_t eyeDX() const { return (w * MOCHI_EYE_DX_PCT) / 100; }
-  int16_t mouthY() const { return eyeY() + MOCHI_EYE_H - 1; }
+  // eye height scales with the body so a small Smily gets small eyes
+  int16_t eyeH() const { return smax((h * MOCHI_EYE_H) / BODY_H, 4); }
+  int16_t mouthY() const { return eyeY() + eyeH() - 1; }
   int16_t left() const { return cx - w / 2; }
   int16_t right() const { return cx + w / 2; }
 };
@@ -81,11 +95,14 @@ static void drawSilhouette(const Pose &p) {
   // Draw them at their true body-relative position and let u8g2 clip anything
   // off-screen: clamping the x to the panel edge used to strand a detached
   // blob of "dots" against the left/right edge when the body leaned.
+  // Limb radius scales with the body so a small Smily (weather view) gets
+  // proportionally small arms/feet instead of fixed r=4 stumps.
+  const int16_t limb = sclamp((p.h * 4) / BODY_H, 2, 4);
   const int16_t armY = p.bottom - p.h / 3;
-  u8g2.drawDisc(x - 1, armY, 4);
-  u8g2.drawDisc(p.right() + 1, armY, 4);
-  u8g2.drawDisc(p.cx - p.w / 4, p.bottom + 2, 4);
-  u8g2.drawDisc(p.cx + p.w / 4, p.bottom + 2, 4);
+  u8g2.drawDisc(x - 1, armY, limb);
+  u8g2.drawDisc(p.right() + 1, armY, limb);
+  u8g2.drawDisc(p.cx - p.w / 4, p.bottom + 2, limb);
+  u8g2.drawDisc(p.cx + p.w / 4, p.bottom + 2, limb);
 
   if (p.h >= 5) {
     u8g2.drawRBox(x, y, p.w, p.h, r);
@@ -183,6 +200,15 @@ static void mouthO(int16_t x, int16_t y) {
   u8g2.drawDisc(x, y + 2, 2);
 }
 
+// a small sad frown, the mirror of mouthHappy's omega
+static void mouthSad(int16_t x, int16_t y) {
+  u8g2.setDrawColor(INK);
+  for (int8_t t = 0; t < 2; t++) {
+    u8g2.drawLine(x - 4, y + 3 + t, x, y + t);
+    u8g2.drawLine(x, y + t, x + 4, y + 3 + t);
+  }
+}
+
 // big yawning oval, h grows with the yawn
 static void mouthYawn(int16_t x, int16_t y, int16_t h) {
   if (h < 2) {
@@ -251,6 +277,208 @@ static void zOutlined(int16_t x, int16_t y, int8_t s) {
 }
 
 // ---------------------------------------------------------------------------
+// Weather. Open-Meteo hands back a WMO weather_code; we bucket it into a few
+// looks (see config.h). SE Asia, so the snow codes never realistically fire
+// and fold into CLOUD rather than get their own winter art.
+// ---------------------------------------------------------------------------
+SkyId sky_from_code(int code) {
+  if (code < 0) return SKY_NONE;
+  // Open-Meteo WMO weather codes. Drizzle 51/53 (light/moderate) is folded into
+  // CLOUD, not rain -- on a keychain "a few droplets" reads better as cloudy,
+  // and it stops the rain face flashing for weather you can barely feel. Only
+  // dense drizzle (55) and actual rain/showers show the rain face.
+  if (code == 0) return SKY_CLEAR;
+  if (code == 1 || code == 2 || code == 3) return SKY_CLOUD;
+  if (code == 45 || code == 48) return SKY_CLOUD;          // fog -> cloud look
+  if (code == 51 || code == 53) return SKY_CLOUD;          // light/moderate drizzle
+  if (code == 95 || code == 96 || code == 99) return SKY_STORM;
+  if (code == 55 || (code >= 56 && code <= 67) ||
+      (code >= 80 && code <= 82)) return SKY_RAIN;          // dense drizzle + real rain
+  if (code >= 71 && code <= 86) return SKY_CLOUD;          // snow/ice (n/a here)
+  return SKY_CLOUD;                                         // anything else: safe
+}
+
+// A plain filled sun: disc plus eight short rays. Lit, with a 1 px dark halo
+// so it stays readable whether it sits on the white body or the black margin.
+static void sunGlyph(int16_t cx, int16_t cy, int8_t r) {
+  u8g2.setDrawColor(0);
+  u8g2.drawDisc(cx, cy, r + 1);          // halo
+  u8g2.setDrawColor(1);
+  u8g2.drawDisc(cx, cy, r);
+  for (uint8_t a = 0; a < 8; a++) {
+    const uint8_t ang = (uint8_t)(a * 32);
+    const int16_t x0 = cx + (icos(ang) * (r + 2)) / 127;
+    const int16_t y0 = cy + (isin(ang) * (r + 2)) / 127;
+    const int16_t x1 = cx + (icos(ang) * (r + 4)) / 127;
+    const int16_t y1 = cy + (isin(ang) * (r + 4)) / 127;
+    u8g2.drawLine(x0, y0, x1, y1);
+  }
+}
+
+// Crescent moon: a lit disc with a second disc punched out of it, offset.
+static void moonGlyph(int16_t cx, int16_t cy, int8_t r) {
+  u8g2.setDrawColor(0);
+  u8g2.drawDisc(cx, cy, r + 1);          // halo
+  u8g2.setDrawColor(1);
+  u8g2.drawDisc(cx, cy, r);
+  u8g2.setDrawColor(0);
+  u8g2.drawDisc(cx + r - 1, cy - 1, r);  // bite out of the top-right
+  u8g2.setDrawColor(1);
+}
+
+// A soft cloud: three overlapping lit discs on a flat base, dark-haloed.
+static void cloudGlyph(int16_t cx, int16_t cy, int8_t s) {
+  // halo first (slightly larger discs in dark), then the lit cloud on top
+  for (int8_t pass = 0; pass < 2; pass++) {
+    const uint8_t col = pass == 0 ? 0 : 1;
+    const int8_t g = pass == 0 ? 1 : 0;  // halo grows the shape by 1 px
+    u8g2.setDrawColor(col);
+    u8g2.drawDisc(cx - s, cy + 1, s - 1 + g);
+    u8g2.drawDisc(cx + s, cy + 1, s - 1 + g);
+    u8g2.drawDisc(cx, cy - 1, s + g);
+    u8g2.drawBox(cx - s - (s - 1) + (pass ? 1 : 0) - g, cy, 2 * s + 2 * (s - 1) + 2 * g, s + g);
+  }
+  u8g2.setDrawColor(1);
+}
+
+// A single short rain streak (a 1 px slanted line), used by the ambient layer
+// and under the overview cloud.
+static void rainStreak(int16_t x, int16_t y, int8_t len) {
+  u8g2.setDrawColor(0);                   // thin dark halo keeps it readable
+  u8g2.drawLine(x - 1, y, x - 1, y + len);
+  u8g2.setDrawColor(1);
+  u8g2.drawLine(x, y, x, y + len);
+}
+
+// A lightning bolt: a short lit zig-zag with a dark halo.
+static void boltGlyph(int16_t x, int16_t y, int8_t h) {
+  for (int8_t pass = 0; pass < 2; pass++) {
+    u8g2.setDrawColor(pass == 0 ? 0 : 1);
+    const int16_t o = pass == 0 ? 0 : 0;
+    (void)o;
+    u8g2.drawLine(x + 2, y, x - 1, y + h / 2);
+    u8g2.drawLine(x - 1, y + h / 2, x + 1, y + h / 2);
+    u8g2.drawLine(x + 1, y + h / 2, x - 2, y + h);
+    if (pass == 0) {  // widen into a halo on the first pass
+      u8g2.drawLine(x + 3, y, x, y + h / 2);
+      u8g2.drawLine(x, y + h / 2, x - 3, y + h);
+    }
+  }
+  u8g2.setDrawColor(1);
+}
+
+// ---------------------------------------------------------------------------
+// Ambient weather layer. Drawn FIRST (behind the mochi), sparse and slow, so
+// the weather reads as a mood in the margins without ever cluttering the face.
+// The silhouette is drawn on top afterwards and occludes anything behind it.
+// `f` is the frame counter, used purely for drift.
+// ---------------------------------------------------------------------------
+static void drawAmbient(SkyId sky, bool isDay, uint16_t f) {
+#if SMILY_WEATHER_AMBIENT
+  // Keep every ambient element inside a safe inset. The panel is a 132-wide
+  // SH1106 clone with a column offset, so anything closer than ~16 px to a
+  // wall smears into a stranded strip against the edge (the "left border").
+  const int16_t SAFE_L = 18;
+  const int16_t SAFE_R = 110;
+  switch (sky) {
+    case SKY_CLEAR: {
+      // day: clean (nothing). night: a couple of still stars so a clear night
+      // reads as night even on the idle face.
+      if (!isDay) {
+        starOutlined(SAFE_L, 10, 1);
+        starOutlined(SAFE_R, 16, 1);
+      }
+      break;
+    }
+    case SKY_CLOUD: {
+      // one small cloud drifting slowly across the TOP band, but bouncing
+      // between the safe margins instead of sliding off the walls (which is
+      // what left the stranded strip on the left edge). Triangle wave L<->R.
+      const int16_t span = SAFE_R - SAFE_L;
+      const int16_t t = (int16_t)((f) % (uint16_t)(2 * span));
+      const int16_t x = SAFE_L + (t < span ? t : (2 * span - t));
+      cloudGlyph(x, 10, 4);
+      if (!isDay) moonGlyph(SAFE_L, 11, 3);  // a small moon marks a cloudy night
+      break;
+    }
+    case SKY_RAIN:
+    case SKY_STORM: {
+      // 4 sparse streaks falling in the side margins, staggered phases so it
+      // never looks like a marching grid. Columns pulled in from the walls.
+      static const int16_t COLX[4] = {SAFE_L, SAFE_L + 10, SAFE_R - 10, SAFE_R};
+      for (uint8_t i = 0; i < 4; i++) {
+        const int16_t y = (int16_t)(((f * 3) + i * 17) % 72) - 8;
+        rainStreak(COLX[i], y, 4);
+      }
+      if (!isDay) moonGlyph(64, 10, 3);  // a small moon up top marks a wet night
+      if (sky == SKY_STORM && ((f / 8) % 11) == 0) {
+        // a brief, rare flash: a bolt in the top band, centred
+        boltGlyph(64, 2, 10);
+      }
+      break;
+    }
+    case SKY_NONE:
+    default:
+      break;
+  }
+#else
+  (void)sky;
+  (void)f;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Tiny procedural digits (3x5), drawn as lit boxes with a 1 px dark halo so a
+// temperature readout stays legible on either colour. Procedural so the
+// preview and the panel render identically and no font is linked into flash.
+// ---------------------------------------------------------------------------
+static const uint8_t DIGIT3x5[11][5] = {
+    {0b111, 0b101, 0b101, 0b101, 0b111},  // 0
+    {0b010, 0b110, 0b010, 0b010, 0b111},  // 1
+    {0b111, 0b001, 0b111, 0b100, 0b111},  // 2
+    {0b111, 0b001, 0b111, 0b001, 0b111},  // 3
+    {0b101, 0b101, 0b111, 0b001, 0b001},  // 4
+    {0b111, 0b100, 0b111, 0b001, 0b111},  // 5
+    {0b111, 0b100, 0b111, 0b101, 0b111},  // 6
+    {0b111, 0b001, 0b001, 0b001, 0b001},  // 7
+    {0b111, 0b101, 0b111, 0b101, 0b111},  // 8
+    {0b111, 0b101, 0b111, 0b001, 0b111},  // 9
+    {0b000, 0b000, 0b100, 0b000, 0b000},  // 10 = minus sign
+};
+
+static void drawDigit(int16_t x, int16_t y, uint8_t d, int8_t scale) {
+  for (int8_t pass = 0; pass < 2; pass++) {
+    u8g2.setDrawColor(pass == 0 ? 0 : 1);
+    const int8_t off = pass == 0 ? 1 : 0;  // halo = draw 1 px out all round
+    for (int8_t r = 0; r < 5; r++)
+      for (int8_t c = 0; c < 3; c++)
+        if (DIGIT3x5[d][r] & (1 << (2 - c))) {
+          if (pass == 0) {
+            u8g2.drawBox(x + c * scale - 1, y + r * scale - 1, scale + 2, scale + 2);
+          } else {
+            u8g2.drawBox(x + c * scale, y + r * scale, scale, scale);
+          }
+        }
+    (void)off;
+  }
+  u8g2.setDrawColor(1);
+}
+
+// Draw an integer (handles a leading minus) centred-ish at x; returns the
+// total pixel width drawn so the caller can place a degree mark after it.
+static int16_t drawNumber(int16_t x, int16_t y, int value, int8_t scale) {
+  char s[8];
+  snprintf(s, sizeof(s), "%d", value);
+  int16_t cx = x;
+  for (int i = 0; s[i]; i++) {
+    const uint8_t d = (s[i] == '-') ? 10 : (uint8_t)(s[i] - '0');
+    drawDigit(cx, y, d, scale);
+    cx += 4 * scale;  // 3 px glyph + 1 px gap
+  }
+  return cx - x;
+}
+
+// ---------------------------------------------------------------------------
 // Keyframe interpolation, used by the wake-up pop
 // ---------------------------------------------------------------------------
 struct KF {
@@ -313,6 +541,7 @@ static void renderIdle(uint16_t f, const FaceCtx &ctx) {
 
   p.squish(squish);
   p.cx = cx;
+  drawAmbient(ctx.sky, ctx.isDay, f);  // quiet weather hint, BEHIND the mochi
   drawSilhouette(p);
 
   const int16_t eyeY = p.eyeY();
@@ -510,6 +739,157 @@ static void renderGoodnight(uint16_t f, const FaceCtx &ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// ANIM_WEATHER - the long-press overview. Laid out in two columns that never
+// overlap: a SMALL Smily lives in the left strip (x < ~42), and the whole
+// right strip (x >= 46) stacks the data top-to-bottom:
+//     clock HH:MM  (big, top)   ->   weather glyph (mid)   ->   temp (bottom)
+// So Smily never obstructs the numbers. Night buckets (cloudy/rainy at night)
+// tuck a small moon behind the cloud so "cloudy night" reads differently from
+// "cloudy day". Lightly animated: rays shimmer, cloud drifts, rain falls.
+// ---------------------------------------------------------------------------
+
+// Two-digit zero-padded number (for a clock field). Returns width drawn.
+static int16_t drawNum2(int16_t x, int16_t y, int v, int8_t scale) {
+  if (v < 0) v = 0;
+  drawDigit(x, y, (uint8_t)((v / 10) % 10), scale);
+  drawDigit(x + 4 * scale, y, (uint8_t)(v % 10), scale);
+  return 8 * scale - scale;  // two glyphs + one gap
+}
+
+// A colon between HH and MM: two small lit squares with a dark halo.
+static void drawColon(int16_t x, int16_t y, int8_t scale) {
+  for (int8_t pass = 0; pass < 2; pass++) {
+    u8g2.setDrawColor(pass == 0 ? 0 : 1);
+    const int8_t g = pass == 0 ? 1 : 0;
+    u8g2.drawBox(x - g, y + scale - g, scale + 2 * g, scale + 2 * g);
+    u8g2.drawBox(x - g, y + 3 * scale - g, scale + 2 * g, scale + 2 * g);
+  }
+  u8g2.setDrawColor(1);
+}
+
+static void renderWeather(uint16_t f, const FaceCtx &ctx) {
+  const SkyId sky = ctx.sky;
+  const bool err = ctx.netError;  // real failure AND no cached reading
+  const bool night = !ctx.isDay;
+
+  // --- left strip: a SMALL Smily, kept entirely left of x=42 so it can never
+  // reach the numbers in the right strip. resize() sets the base so the later
+  // squish() flexes around THIS small size instead of snapping back to full.
+  Pose p;
+  p.resize(32, 26);
+  p.cx = 19;
+  p.bottom = 56;
+  p.squish(wave((uint8_t)(f * 3), 1));  // gentle breathing: clearly alive
+  drawSilhouette(p);
+  const int16_t eyeY = p.eyeY();
+  const int16_t dx = p.eyeDX();
+  if (err) {
+    eyeSleep(p.cx - dx, eyeY);
+    eyeSleep(p.cx + dx, eyeY);
+    mouthSad(p.cx, p.mouthY());
+  } else {
+    eyeHappy(p.cx - dx, eyeY);
+    eyeHappy(p.cx + dx, eyeY);
+    mouthSmall(p.cx, p.mouthY());
+  }
+
+  // A thin divider so the two columns read as separate panels.
+  u8g2.setDrawColor(1);
+  u8g2.drawVLine(44, 6, 52);
+
+  // --- error state: the only thing drawn in the right strip when a fetch
+  // failed with no cached reading. A slashed cloud + the raw code.
+  if (err) {
+    cloudGlyph(96, 20, 7);
+    u8g2.setDrawColor(0);
+    u8g2.drawLine(84, 32, 108, 8);
+    u8g2.drawLine(85, 32, 109, 8);
+    u8g2.setDrawColor(1);
+    u8g2.drawLine(84, 31, 108, 7);
+    drawNumber(74, 46, ctx.errCode, 2);  // e.g. -11
+    return;
+  }
+
+  if (sky == SKY_NONE) {
+    // Still connecting / first fetch pending, nothing failed: "working on it".
+    u8g2.setDrawColor(1);
+    for (int8_t i = 0; i < 3; i++) u8g2.drawDisc(78 + i * 12, 30, 2);
+    return;
+  }
+
+  // --- right strip, top: the clock HH:MM, big. Only drawn when we actually
+  // have a time (hour >= 0); otherwise the glyph slides up to fill the space.
+  const bool haveClock = ctx.hour >= 0 && ctx.minute >= 0;
+  if (haveClock) {
+    int16_t cx = 50;
+    cx += drawNum2(cx, 4, ctx.hour, 2) + 3;
+    drawColon(cx, 4, 2);
+    cx += 2 + 4;
+    drawNum2(cx, 4, ctx.minute, 2);
+  }
+
+  // --- right strip, mid: the weather glyph. Sits lower when the clock is
+  // present, higher (centred) when it is not.
+  const int16_t gx = 96;
+  const int16_t gy = haveClock ? 30 : 20;
+
+  // At night, mark cloud/rain/storm as NIGHT: a small crescent moon peeks out
+  // up-left of the cloud, plus a couple of tiny stars, so "cloudy night" and
+  // "rainy night" read clearly differently from their daytime versions.
+  if (night && (sky == SKY_CLOUD || sky == SKY_RAIN || sky == SKY_STORM)) {
+    moonGlyph(gx - 10, gy - 8, 4);
+    starOutlined(gx + 9, gy - 9, 1);
+    starOutlined(gx - 2, gy - 11, 1);
+  }
+
+  switch (sky) {
+    case SKY_CLEAR:
+      if (ctx.isDay) sunGlyph(gx, gy, 7);
+      else           moonGlyph(gx, gy, 8);
+      break;
+    case SKY_CLOUD:
+      cloudGlyph(gx, gy, 7);
+      break;
+    case SKY_RAIN:
+      cloudGlyph(gx, gy, 6);
+      for (uint8_t i = 0; i < 3; i++) {
+        const int16_t rx = gx - 8 + i * 8;
+        const int16_t ry = gy + 7 + (int16_t)(((f * 3) + i * 9) % 10);
+        rainStreak(rx, ry, 4);
+      }
+      break;
+    case SKY_STORM:
+      cloudGlyph(gx, gy, 6);
+      boltGlyph(gx, gy + 7, 11);
+      break;
+    default:
+      break;
+  }
+
+  // --- right strip, bottom: the temperature, "NN" + a small degree ring.
+  const int16_t ty = 48;
+  const int16_t tx = 50;
+  const int16_t w = drawNumber(tx, ty, ctx.tempC, 2);
+  u8g2.setDrawColor(0);
+  u8g2.drawDisc(tx + w + 2, ty + 1, 2);
+  u8g2.setDrawColor(1);
+  u8g2.drawCircle(tx + w + 2, ty + 1, 1);
+
+  // Humidity, measured by the DHT11, shown as a compact "NN%" at the far
+  // bottom-right. Only drawn when the sensor has actually produced a reading
+  // (humidity >= 0); a bare glyph with no number would just read as noise.
+  if (ctx.humidity >= 0) {
+    int16_t hx = tx + w + 10;          // start just past the degree ring
+    const int16_t hy = ty + 3;         // a touch lower + smaller than the temp
+    hx += drawNumber(hx, hy, ctx.humidity, 1);
+    // A tiny percent sign: two dots with a thin slash between them.
+    u8g2.drawPixel(hx + 1, hy);
+    u8g2.drawLine(hx + 3, hy + 4, hx + 1, hy);   // slash, top-left to bottom
+    u8g2.drawPixel(hx + 3, hy + 4);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 void faces_render(AnimId id, uint16_t frame, const FaceCtx &ctx) {
@@ -527,6 +907,9 @@ void faces_render(AnimId id, uint16_t frame, const FaceCtx &ctx) {
       break;
     case ANIM_DIZZY:
       renderDizzy(frame, ctx);
+      break;
+    case ANIM_WEATHER:
+      renderWeather(frame, ctx);
       break;
     case ANIM_GOODNIGHT:
       renderGoodnight(frame, ctx);

@@ -155,6 +155,9 @@ static void captureFidget(FidgetId fid, uint16_t lenMs, const char *name) {
   ctx.fidget = fid;
   ctx.fidgetLenMs = lenMs;
   ctx.mood = MOOD_NEUTRAL;
+  ctx.sky = SKY_NONE;
+  ctx.tempC = 0;
+  ctx.isDay = true;
   const uint16_t n = lenMs / FRAME_INTERVAL_MS;
   for (uint16_t i = 0; i < n; i++) {
     ctx.fidgetMs = (uint16_t)(i * FRAME_INTERVAL_MS);
@@ -184,14 +187,83 @@ static void captureMoods() {
   g_capture = false;
   writeSheet("out/09-moods.pgm", MOOD_COUNT, 3, 0);
 }
+// The weather overview (long-press), one cell per sky bucket, plus a
+// no-data cell. Also captures the idle ambient layer for each sky so the
+// behind-the-face rain/cloud/stars can be eyeballed.
+static void captureWeather() {
+  struct W { SkyId sky; int8_t t; int8_t rh; bool day; int8_t hh; int8_t mm; const char *tag; };
+  const W views[] = {
+      {SKY_CLEAR, 31, 55, true,  14, 25, "clear-day"},
+      {SKY_CLEAR, 27, 62, false,  0, 15, "clear-night"},
+      {SKY_CLOUD, 29, 70, true,  11,  5, "cloud-day"},
+      {SKY_CLOUD, 26, 74, false, 22, 40, "cloud-night"},
+      {SKY_RAIN,  26, 88, true,  16, 50, "rain-day"},
+      {SKY_RAIN,  24, 91, false, 23, 10, "rain-night"},
+      {SKY_STORM, 25, 93, true,  17, 30, "storm-day"},
+      {SKY_STORM, 23, 90, false,  2, 55, "storm-night"},
+  };
+  g_frames.clear();
+  g_capture = true;
+  FaceCtx ctx;
+  for (size_t i = 0; i < sizeof(views) / sizeof(W); i++) {
+    ctx.sky = views[i].sky;
+    ctx.tempC = views[i].t;
+    ctx.humidity = views[i].rh;
+    ctx.isDay = views[i].day;
+    ctx.hour = views[i].hh;
+    ctx.minute = views[i].mm;
+    ctx.netError = false;
+    ctx.errCode = 0;
+    faces_render(ANIM_WEATHER, 6, ctx);  // frame 6: rays/rain mid-motion
+    u8g2.sendBuffer();
+  }
+  // a reading with no clock yet (time field missing) -> glyph centres, no HH:MM
+  {
+    FaceCtx n;
+    n.sky = SKY_CLEAR; n.tempC = 30; n.humidity = 58; n.isDay = true;
+    n.hour = -1; n.minute = -1;
+    faces_render(ANIM_WEATHER, 6, n);
+    u8g2.sendBuffer();
+  }
+  // a real fetch error with no cached reading (e.g. -11)
+  {
+    FaceCtx e;
+    e.sky = SKY_NONE;
+    e.netError = true;
+    e.errCode = -11;
+    faces_render(ANIM_WEATHER, 6, e);
+    u8g2.sendBuffer();
+  }
+  g_capture = false;
+  writeSheet("out/10-weather.pgm", 4, 3, 0);
+
+  // Idle ambient layer per sky, day row then night row (face + behind-the-face
+  // weather hint). Night adds a small moon/stars so a cloudy/rainy NIGHT reads
+  // differently on the idle face too.
+  g_frames.clear();
+  g_capture = true;
+  FaceCtx amb;
+  const SkyId skies[] = {SKY_CLEAR, SKY_CLOUD, SKY_RAIN, SKY_STORM};
+  for (int8_t day = 1; day >= 0; day--) {
+    for (size_t i = 0; i < sizeof(skies) / sizeof(SkyId); i++) {
+      amb.sky = skies[i];
+      amb.isDay = day != 0;
+      faces_render(ANIM_IDLE, 20, amb);  // frame 20: ambient drift mid-cycle
+      u8g2.sendBuffer();
+    }
+  }
+  g_capture = false;
+  writeSheet("out/11-ambient.pgm", 4, 3, 0);
+}
+
+
 
 static void captureHero() {
   // one representative frame per state, rendered large
   struct Pick {
     AnimId id;
     uint16_t frame;
-  };
-  const Pick picks[] = {{ANIM_IDLE, 0},  {ANIM_PET, 4},       {ANIM_DIZZY, 6},
+  };  const Pick picks[] = {{ANIM_IDLE, 0},  {ANIM_PET, 4},       {ANIM_DIZZY, 6},
                         {ANIM_WAKE, 12}, {ANIM_GOODNIGHT, 8}, {ANIM_IDLE, 3}};
   g_frames.clear();
   g_capture = true;
@@ -341,11 +413,50 @@ static void runSim() {
   advance(2600);
   check(sm_state() == STATE_IDLE, "DIZZY returns to IDLE after the shake");
 
-  printf("\n--- inactivity -> sleep ---\n");
-  advance(SLEEP_TIMEOUT_MS + 1500);
-  check(sm_state() == STATE_SLEEP, "15 s of quiet enters SLEEP");
-  check(u8g2.powerSave, "SH1106 was put into its low-power state");
-  check(hostMpu.asleep, "MPU was parked before deep sleep");
+  printf("\n--- long press -> weather ---\n");
+  hostTouchLevel = HIGH;
+  advance(LONG_PRESS_MS + 60);       // hold past the long-press threshold
+  check(sm_state() == STATE_WEATHER, "a long press opens the weather view");
+  hostTouchLevel = LOW;
+  advance(300);                      // release is not a tap here
+  check(sm_state() == STATE_WEATHER, "weather view stays up after release");
+
+  printf("\n--- weather view dismiss on tap ---\n");
+  tapN(1, 60, 500);
+  check(sm_state() == STATE_IDLE, "a tap dismisses the weather view early");
+
+  printf("\n--- weather view auto-returns after WEATHER_VIEW_MS ---\n");
+  hostTouchLevel = HIGH;
+  advance(LONG_PRESS_MS + 60);
+  check(sm_state() == STATE_WEATHER, "long press re-opens the weather view");
+  hostTouchLevel = LOW;
+  advance(WEATHER_VIEW_MS + 300);
+  check(sm_state() == STATE_IDLE, "weather view times out back to IDLE");
+
+  printf("\n--- inactivity -> sleep (15 s goodnight) ---\n");
+  advance(SLEEP_TIMEOUT_MS + 200);
+  check(sm_state() == STATE_SLEEP, "quiet period enters SLEEP");
+  // The 15 s goodnight is still PLAYING here: the panel must NOT be off yet,
+  // so the user actually gets to watch Smily drift off.
+  check(!u8g2.powerSave, "panel stays lit during the 15 s goodnight");
+  const size_t flushesDuringGoodnight = g_flushTimes.size();
+  advance(1000);
+  check(g_flushTimes.size() > flushesDuringGoodnight,
+        "goodnight keeps animating (frames still flushing)");
+
+  printf("\n--- goodnight can be cancelled by a touch ---\n");
+  hostTouchLevel = HIGH;
+  advance(80);
+  check(sm_state() == STATE_IDLE, "a touch during goodnight bounces back to IDLE");
+  hostTouchLevel = LOW;
+  advance(500);
+
+  printf("\n--- goodnight runs its course -> panel off ---\n");
+  advance(SLEEP_TIMEOUT_MS + 200);
+  check(sm_state() == STATE_SLEEP, "quiet enters SLEEP again");
+  advance(GOODNIGHT_ANIM_MS + 500);  // let the full 15 s farewell complete
+  check(u8g2.powerSave, "SH1106 enters low-power once goodnight finishes");
+  check(hostMpu.asleep, "MPU is parked before deep sleep");
   const size_t flushesAtSleep = g_flushTimes.size();
   advance(3000);
   check(g_flushTimes.size() == flushesAtSleep,
@@ -442,6 +553,7 @@ int main(int argc, char **argv) {
   captureFidget(FIDGET_LOOK, FIDGET_LOOK_MS, "07-fidget-look");
   captureFidget(FIDGET_WIGGLE, FIDGET_WIGGLE_MS, "08-fidget-wiggle");
   captureMoods();
+  captureWeather();
   captureHero();
 
   runSim();

@@ -16,7 +16,9 @@ g++ -std=c++17 -Wall -Wextra -Wno-unused-parameter -O1 \
     "$FW/display.cpp" \
     "$FW/input_handler.cpp" \
     "$FW/motion.cpp" \
+    "$FW/net.cpp" \
     "$FW/power.cpp" \
+    "$FW/sensor.cpp" \
     "$FW/state_machine.cpp" \
     -o out/preview
 
