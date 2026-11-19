@@ -211,7 +211,11 @@
 #define NET_FETCH_ATTEMPTS       3          // total GET attempts per fetch before the
                                             // error face shows; a stalled read (-11) or
                                             // a truncated/empty body is retried in-place
-#define NET_FETCH_RETRY_GAP_MS   400UL      // short pause between those in-fetch retries
+#define NET_FETCH_RETRY_GAP_MS   2000UL     // pause between in-fetch retries. A
+                                            // phone-hotspot NAT often drops the
+                                            // FIRST outbound TCP from a new client
+                                            // (GET -> -1); a ~2 s gap lets the NAT
+                                            // table prime so the retry connects.
 
 // --- Weather face (Phase 4) ------------------------------------------------
 // A long press opens the weather view. The idle face also carries a quiet

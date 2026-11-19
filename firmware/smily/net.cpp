@@ -37,6 +37,96 @@ static uint32_t  s_connectStartMs = 0;
 static uint32_t  s_nextFetchMs = 0;
 static uint32_t  s_retryAtMs   = 0;
 
+// Last low-level disconnect reason, captured from the Wi-Fi event. WiFi.status()
+// only ever says "6 = disconnected"; the ACTUAL cause (auth failed, AP not
+// found, beacon lost, AP kicked us) lives in the STA_DISCONNECTED event's
+// reason field and nowhere else. 0 = none seen yet.
+static volatile uint8_t s_lastDiscReason = 0;
+
+// ---- Diagnostics: turn the coarse status + low-level reason into words -----
+
+// WiFi.status() value -> short name. This is the 5-state connection summary,
+// NOT the failure cause -- 6 just means "not associated right now".
+static const char *statusName(int s) {
+  switch (s) {
+    case WL_NO_SHIELD:       return "NO_SHIELD";
+    case WL_IDLE_STATUS:     return "IDLE(0)";
+    case WL_NO_SSID_AVAIL:   return "NO_SSID_AVAIL(1)";   // name wrong / 5GHz / AP asleep
+    case WL_SCAN_COMPLETED:  return "SCAN_DONE(2)";
+    case WL_CONNECTED:       return "CONNECTED(3)";
+    case WL_CONNECT_FAILED:  return "CONNECT_FAILED(4)";  // usually wrong password
+    case WL_CONNECTION_LOST: return "CONN_LOST(5)";
+    case WL_DISCONNECTED:    return "DISCONNECTED(6)";    // associating, handshake not done
+    default:                 return "UNKNOWN";
+  }
+}
+
+// Low-level 802.11 disconnect reason (esp_wifi's wifi_err_reason_t) -> words.
+// THIS is the real "what went wrong in the handshake" answer:
+//   - AUTH_* / HANDSHAKE_TIMEOUT / 4WAY_HANDSHAKE_TIMEOUT -> wrong password
+//   - NO_AP_FOUND                                         -> SSID not there / 5GHz / out of range
+//   - BEACON_TIMEOUT / ASSOC_LEAVE / ASSOC_EXPIRE         -> signal dropped / AP kicked us (weak RF)
+// A brownout from TX current spikes is NOT a reason code -- it resets the chip,
+// so you see a reboot line in the log, not a value here.
+static const char *discReasonName(uint8_t r) {
+  switch (r) {
+    case WIFI_REASON_AUTH_EXPIRE:            return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:             return "AUTH_LEAVE";
+    case WIFI_REASON_ASSOC_EXPIRE:           return "ASSOC_EXPIRE";
+    case WIFI_REASON_ASSOC_TOOMANY:          return "ASSOC_TOOMANY(AP full)";
+    case WIFI_REASON_NOT_AUTHED:             return "NOT_AUTHED";
+    case WIFI_REASON_NOT_ASSOCED:            return "NOT_ASSOCED";
+    case WIFI_REASON_ASSOC_LEAVE:            return "ASSOC_LEAVE";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:       return "ASSOC_NOT_AUTHED";
+    case WIFI_REASON_BEACON_TIMEOUT:         return "BEACON_TIMEOUT(weak signal)";
+    case WIFI_REASON_NO_AP_FOUND:            return "NO_AP_FOUND(SSID/5GHz/range)";
+    case WIFI_REASON_AUTH_FAIL:              return "AUTH_FAIL(bad password)";
+    case WIFI_REASON_ASSOC_FAIL:             return "ASSOC_FAIL";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:      return "HANDSHAKE_TIMEOUT(bad pw/weak)";
+    case WIFI_REASON_CONNECTION_FAIL:        return "CONNECTION_FAIL";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "4WAY_HANDSHAKE_TIMEOUT(bad pw)";
+    case 0:                                  return "none";
+    // Everything else: we deliberately do NOT hardcode raw numbers here. The
+    // named WIFI_REASON_* constants above ARE the standard 802.11 numbers
+    // (AUTH_EXPIRE=2, ASSOC_TOOMANY=5, 4WAY_HANDSHAKE_TIMEOUT=15, ...), and the
+    // SDK adds more named ones (16, 23, 24, ...) whose values we can't pin down
+    // at authoring time -- matching those by raw number trips "duplicate case
+    // value". So any unmapped code falls through here; the lastReason=%u field
+    // in the log still prints the NUMBER, which you can look up. Codes in the
+    // 30s-40s are QoS / block-ack / congestion reasons (the AP dropping a weak
+    // or busy link), e.g. 36 = EXCEEDED_TXOP on a congested/weak hotspot link.
+    default:                                 return "unmapped(see number)";
+  }
+}
+
+// Wi-Fi event callback. We only care about the disconnect reason; stash it so
+// the timeout log can report WHY the last attempt dropped.
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    s_lastDiscReason = info.wifi_sta_disconnected.reason;
+  }
+}
+
+// One combined diagnostic line: coarse status + signal strength + the real
+// low-level reason. RSSI tells weak RF from everything else (below ~-80 dBm
+// associations start failing); the reason tells auth/handshake vs no-AP vs
+// a dropped beacon. Printed on every connect timeout and retry.
+static void logLinkDiag(const char *why) {
+  const int st = WiFi.status();
+  // RSSI only has meaning while associated. When we are NOT connected the
+  // driver returns 0, which reads like "perfect signal" but means "no reading".
+  // Say so explicitly rather than print a misleading 0 dBm.
+  if (st == WL_CONNECTED) {
+    SMILY_LOG("[net] %s: status=%s, RSSI=%lddBm, lastReason=%u(%s)\n",
+              why, statusName(st), (long)WiFi.RSSI(),
+              (unsigned)s_lastDiscReason, discReasonName(s_lastDiscReason));
+  } else {
+    SMILY_LOG("[net] %s: status=%s, RSSI=n/a(not associated), lastReason=%u(%s)\n",
+              why, statusName(st),
+              (unsigned)s_lastDiscReason, discReasonName(s_lastDiscReason));
+  }
+}
+
 // Record why a fetch failed, so the UI can show an error only on a real
 // failure. HTTP status (>0), transport error (<0, e.g. -11), or 0 for a
 // non-HTTP failure (empty body / parse / missing field).
@@ -77,11 +167,39 @@ static FetchResult fetchWeatherOnce(uint32_t now, int *outCode) {
   http.setConnectTimeout(NET_HTTP_TIMEOUT_MS);
   http.setTimeout(NET_HTTP_TIMEOUT_MS);
 
+  // DNS probe first. A GET -> -1 (can't connect) is usually a DNS failure, not
+  // the weather server being down -- phone hotspots often hand out a DNS they
+  // then don't route. Resolve the host explicitly so the log says WHICH it is:
+  //   resolve fails          -> DNS/no-internet (the hotspot's fault)
+  //   resolve OK but GET -1   -> TCP refused/blocked (firewall / captive portal)
+  IPAddress hostIp;
+  if (!WiFi.hostByName("api.open-meteo.com", hostIp)) {
+    SMILY_LOG("[net] DNS resolve FAILED for api.open-meteo.com (DNS %s) "
+              "-- AP gave no working DNS / no internet\n",
+              WiFi.dnsIP().toString().c_str());
+    *outCode = 0;
+    return FETCH_RETRY;           // DNS down: a retry may succeed if AP settles
+  }
+  SMILY_LOG("[net] DNS ok: api.open-meteo.com -> %s\n",
+            hostIp.toString().c_str());
+
   if (!http.begin(weatherUrl())) {
     SMILY_LOG("[net] http.begin failed\n");
     *outCode = 0;
     return FETCH_RETRY;            // local setup hiccup: a retry may succeed
   }
+
+  // Hotspot-NAT hardening. On a phone hotspot a GET can come back -1 (connection
+  // refused) even with a strong link and working DNS, because the AP's NAT is
+  // fussy about the very first outbound TCP from a new client:
+  //  - a User-Agent: some middleboxes drop a header-less request outright.
+  //  - Connection: close + no keep-alive reuse: avoids a half-open reused
+  //    socket that the NAT has already dropped (a classic source of -1).
+  //  - HTTP/1.0: simplest request/response, no chunked/keep-alive assumptions.
+  http.setReuse(false);
+  http.useHTTP10(true);
+  http.setUserAgent("Smily/1.0 (ESP32-C3)");
+  http.addHeader("Connection", "close");
 
   const int rc = http.GET();
   *outCode = rc;
@@ -192,10 +310,17 @@ void net_begin(uint32_t now) {
   // fail with shifting status codes (0/4/6). Clearing persistent state and
   // disconnecting the radio first gives every attempt the same clean start.
   WiFi.persistent(false);       // don't reuse flash-saved connection state
+  WiFi.onEvent(onWiFiEvent);    // capture the low-level disconnect reason
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);        // drop any half-held association, radio off
   WiFi.mode(WIFI_STA);          // radio back on, fresh
   WiFi.setAutoReconnect(true);
+  // Crank TX power to the C3 maximum (19.5 dBm). Helps punch through a weak or
+  // obstructed link (our antenna sits over a copper plane), at the cost of a
+  // bigger current spike on each transmit -- fine on USB, watch it on battery.
+  // Must be set AFTER mode(WIFI_STA) so the radio exists. Does NOT fix a
+  // detuned antenna, only adds a few dB of headroom.
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.begin(SMILY_WIFI_SSID, SMILY_WIFI_PASSWORD);
   s_stage = NET_CONNECTING;
   s_connectStartMs = now;
@@ -211,7 +336,16 @@ NetStage net_poll(uint32_t now) {
       if (WiFi.status() == WL_CONNECTED) {
         s_stage = NET_ONLINE;
         s_nextFetchMs = now;  // fetch immediately on first connect
-        SMILY_LOG("[net] online, IP %s\n", WiFi.localIP().toString().c_str());
+        // Dump the full link picture on connect. RSSI is now meaningful (we're
+        // associated). gateway/DNS matter because a GET -> -1 (can't connect)
+        // is usually a BAD or MISSING DNS from the AP, not the weather server:
+        // a phone hotspot often hands out a DNS it then doesn't route. A DNS of
+        // 0.0.0.0 here is the smoking gun for the -1 failures.
+        SMILY_LOG("[net] online, IP %s, GW %s, DNS %s, RSSI %lddBm\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str(),
+                  WiFi.dnsIP().toString().c_str(),
+                  (long)WiFi.RSSI());
       } else if (elapsed(now, s_connectStartMs) >= NET_CONNECT_TIMEOUT_MS) {
         s_stage = NET_FAILED;
         s_retryAtMs = now + NET_RETRY_MS;
@@ -220,6 +354,10 @@ NetStage net_poll(uint32_t now) {
         // 6=disconnected. 3 would be WL_CONNECTED (success).
         SMILY_LOG("[net] connect timed out (status %d), retry in %lus\n",
                   (int)WiFi.status(), (unsigned long)(NET_RETRY_MS / 1000));
+        // Full diagnosis: weak signal (low RSSI) vs bad password (AUTH_FAIL /
+        // handshake timeout) vs wrong SSID/band (NO_AP_FOUND) vs AP dropping us
+        // (BEACON_TIMEOUT / ASSOC_LEAVE). A brownout shows as a reboot, not here.
+        logLinkDiag("timeout");
       }
       break;
 
@@ -256,7 +394,7 @@ NetStage net_poll(uint32_t now) {
         WiFi.begin(SMILY_WIFI_SSID, SMILY_WIFI_PASSWORD);
         s_stage = NET_CONNECTING;
         s_connectStartMs = now;
-        SMILY_LOG("[net] retrying connect...\n");
+        logLinkDiag("retrying");
       }
       break;
   }
